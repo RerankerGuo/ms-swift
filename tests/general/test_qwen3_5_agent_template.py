@@ -1,20 +1,22 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Regression tests for #10255.
 
-The Qwen3.5/3.6 swift backend was dropping the assistant's ``<think>...</think>``
-reasoning whenever the same assistant turn also carried ``tool_calls`` (and, in
-the history-thinking path, whenever a tool message sat between the user prompt
-and the assistant reasoning). The official ``chat_template.jinja`` (used by
-vLLM / transformers at inference) keeps both, which is the root cause of the
-train/infer mismatch on Qwen3.5/3.6 agent data (the same upstream issue as
-#9234 — ``</think><|im_end|>`` / empty ``<tool_call>`` after SFT).
+With the Qwen3.5/3.6 swift backend, an assistant turn that carries both ``<think>...</think>`` reasoning
+and ``tool_calls`` lost its reasoning whenever a tool message sat between the user prompt and that turn:
+``_remove_history_thinking`` / ``_add_non_thinking_prefix`` took the last ``tool`` message as the round
+boundary and treated the current agent round as history. The official ``chat_template.jinja`` (used by
+vLLM / transformers at inference) only looks at the last ``user`` message, so the trained format differed
+from the served one (the train/infer mismatch behind #9234).
 
-These tests exercise the agent-template and template-base hooks directly,
-without loading a model or downloading tokenizer files, so they run on CPU
-only.
+``TestQwen3_5AddToolCallPrefix`` and ``TestGetLastUserRoundIncludeTool`` are CPU-only unit tests.
+``TestQwen3_5EncodeMatchesJinja`` is the encode-level check: it needs the tokenizer (no weights are
+downloaded) and compares ``template.encode`` with ``tokenizer.apply_chat_template`` token by token.
 """
+import copy
 import json
+import os
 import unittest
+from functools import lru_cache
 
 from swift.agent_template import agent_template_map
 from swift.template.base import Template
@@ -22,12 +24,10 @@ from swift.template.utils import get_last_user_round
 
 
 class TestQwen3_5AddToolCallPrefix(unittest.TestCase):
-    """The Qwen3.5/3.6 jinja keeps the preceding assistant ``content`` (including
-    ``<think>...</think>`` reasoning) before ``<tool_call>`` and only inserts
-    ``\\n\\n`` between them when the effective (post-think) content is
-    non-empty. The previous swift implementation used ``pre_message['content']``
-    only to decide on the separator and dropped the reasoning entirely — see
-    #10255.
+    """``_add_tool_call_prefix`` only adds the ``\\n\\n`` that the jinja inserts between the effective
+    (post-``</think>``) assistant content and ``<tool_call>``. It must not prepend the preceding assistant
+    content: that message stays in ``messages`` and is merged with the tool call afterwards, so prepending
+    it here renders the reasoning twice.
     """
 
     def setUp(self):
@@ -43,62 +43,31 @@ class TestQwen3_5AddToolCallPrefix(unittest.TestCase):
         }
         self.tool_content = self.tpl._format_tool_calls([self.tool_call_msg])
 
-    def test_think_plus_post_text_then_tool_call_keeps_thinking_and_separator(self):
-        pre = {
-            'role': 'assistant',
-            'content': '<think>\nI need to check the stock first.\n</think>\n\n',
-        }
+    def test_post_think_text_adds_separator_only(self):
+        pre = {'role': 'assistant', 'content': '<think>\nplan\n</think>\n\nSome preamble text.'}
         out = self.tpl._add_tool_call_prefix(self.tool_content, pre)
-        # Reasoning must be preserved verbatim (this was the regression).
-        self.assertIn('<think>\nI need to check the stock first.\n</think>', out)
-        # Effective content after </think> is empty here, but the original
-        # content ends in '\n\n' so we still want the <tool_call> to follow it
-        # without an extra blank line inserted by the prefix hook.
-        self.assertTrue(out.startswith(pre['content']))
-        # The tool_call block must follow.
-        self.assertTrue(out.endswith(self.tool_content))
+        self.assertEqual(out, '\n\n' + self.tool_content)
 
-    def test_pure_thinking_then_tool_call_keeps_thinking_without_extra_separator(self):
-        pre = {
-            'role': 'assistant',
-            'content': '<think>\nonly thinking, no post-text\n</think>',
-        }
+    def test_text_without_think_adds_separator_only(self):
+        pre = {'role': 'assistant', 'content': 'Some preamble text.'}
         out = self.tpl._add_tool_call_prefix(self.tool_content, pre)
-        # Reasoning preserved.
-        self.assertIn('only thinking, no post-text', out)
-        # No inserted '\\n\\n' separator between </think> and <tool_call> when
-        # there is no post-think text — the jinja template just concatenates.
-        self.assertNotIn('</think>\n\n<tool_call>', out)
-        self.assertTrue(out.endswith('</think>' + self.tool_content))
+        self.assertEqual(out, '\n\n' + self.tool_content)
 
-    def test_think_plus_post_text_then_tool_call_inserts_separator(self):
-        pre = {
-            'role': 'assistant',
-            'content': '<think>\nplan\n</think>\nSome preamble text.',
-        }
-        out = self.tpl._add_tool_call_prefix(self.tool_content, pre)
-        # Reasoning preserved.
-        self.assertIn('plan', out)
-        # Separator before tool_call when effective content is non-empty.
-        self.assertIn('Some preamble text.\n\n<tool_call>', out)
+    def test_pure_thinking_adds_nothing(self):
+        for content in ('<think>\nonly thinking\n</think>\n\n', '<think>\nonly thinking\n</think>'):
+            pre = {'role': 'assistant', 'content': content}
+            self.assertEqual(self.tpl._add_tool_call_prefix(self.tool_content, pre), self.tool_content)
 
     def test_no_pre_message_returns_tool_content_unchanged(self):
-        out = self.tpl._add_tool_call_prefix(self.tool_content, None)
-        self.assertEqual(out, self.tool_content)
+        self.assertEqual(self.tpl._add_tool_call_prefix(self.tool_content, None), self.tool_content)
 
     def test_non_assistant_pre_message_returns_tool_content_unchanged(self):
-        out = self.tpl._add_tool_call_prefix(self.tool_content, {
-            'role': 'user',
-            'content': 'no preceding assistant here',
-        })
-        self.assertEqual(out, self.tool_content)
+        pre = {'role': 'user', 'content': 'no preceding assistant here'}
+        self.assertEqual(self.tpl._add_tool_call_prefix(self.tool_content, pre), self.tool_content)
 
     def test_empty_string_content_returns_tool_content_unchanged(self):
-        out = self.tpl._add_tool_call_prefix(self.tool_content, {
-            'role': 'assistant',
-            'content': '',
-        })
-        self.assertEqual(out, self.tool_content)
+        pre = {'role': 'assistant', 'content': ''}
+        self.assertEqual(self.tpl._add_tool_call_prefix(self.tool_content, pre), self.tool_content)
 
 
 class TestGetLastUserRoundIncludeTool(unittest.TestCase):
@@ -178,6 +147,244 @@ class TestGetLastUserRoundIncludeTool(unittest.TestCase):
                      '`get_last_user_round(messages, include_tool=False)` '
                      'to match the official jinja boundary; #10255'),
             )
+
+
+# Only the tokenizer / config files are fetched (``load_model=False``), never the weights. Any Qwen3.5/3.6 checkpoint
+# with the official chat template works; point the variable at a local directory to run offline.
+MODEL_ID = os.getenv('QWEN3_5_TEST_MODEL') or 'Qwen/Qwen3.5-35B-A3B'
+
+TOOLS = [{
+    'type': 'function',
+    'function': {
+        'name': 'search',
+        'description': 'Search.',
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'query': {
+                    'type': 'string'
+                }
+            },
+            'required': ['query']
+        },
+    },
+}, {
+    'type': 'function',
+    'function': {
+        'name': 'read',
+        'description': 'Read a page.',
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'url': {
+                    'type': 'string'
+                }
+            },
+            'required': ['url']
+        },
+    },
+}]
+
+
+def _call(name, **arguments):
+    return {'type': 'function', 'function': {'name': name, 'arguments': arguments}}
+
+
+def _think(text):
+    return f'<think>\n{text}\n</think>\n\n'
+
+
+def _user(text):
+    return {'role': 'user', 'content': text}
+
+
+def _assistant(content, *tool_calls):
+    message = {'role': 'assistant', 'content': content}
+    if tool_calls:
+        message['tool_calls'] = list(tool_calls)
+    return message
+
+
+def _tool(name, content):
+    return {'role': 'tool', 'name': name, 'content': content}
+
+
+# (messages, number of user turns). Every conversation ends with an assistant turn, like a training sample.
+CASES = {
+    # the repro from #10255: reasoning + tool_calls, then reasoning + answer
+    'issue_repro': [
+        _user('Check the stock and draft an order email if it is low.'),
+        _assistant(_think('I need to check the stock first.'), _call('search', query='stock')),
+        _tool('search', 'Stock: 3 left.'),
+        _assistant(_think('3 is low, so an order is needed.') + 'Stock is low (3 left). Here is the draft.'),
+    ],
+    'two_tool_steps': [
+        _user('q'),
+        _assistant(_think('t1'), _call('search', query='a')),
+        _tool('search', 'r1'),
+        _assistant(_think('t2'), _call('read', url='u')),
+        _tool('read', 'r2'),
+        _assistant(_think('t3') + 'done'),
+    ],
+    'reasoning_and_preamble_before_call': [
+        _user('q'),
+        _assistant(_think('t1') + 'Let me search.', _call('search', query='a')),
+        _tool('search', 'r1'),
+        _assistant(_think('t2') + 'answer'),
+    ],
+    'parallel_calls': [
+        _user('q'),
+        _assistant(_think('t1'), _call('search', query='a'), _call('read', url='u')),
+        _tool('search', 'r1'),
+        _tool('read', 'r2'),
+        _assistant(_think('t2') + 'answer'),
+    ],
+    'parallel_calls_with_preamble': [
+        _user('q'),
+        _assistant(_think('t1') + 'pre', _call('search', query='a'), _call('read', url='u')),
+        _tool('search', 'r1'),
+        _tool('read', 'r2'),
+        _assistant(_think('t2') + 'answer'),
+    ],
+    'call_without_reasoning': [
+        _user('q'),
+        _assistant('', _call('search', query='a')),
+        _tool('search', 'r1'),
+        _assistant('answer'),
+    ],
+    'preamble_without_reasoning': [
+        _user('q'),
+        _assistant('Let me search.', _call('search', query='a')),
+        _tool('search', 'r1'),
+        _assistant('answer'),
+    ],
+    'empty_reasoning': [
+        _user('q'),
+        _assistant(_think(''), _call('search', query='a')),
+        _tool('search', 'r1'),
+        _assistant(_think('') + 'answer'),
+    ],
+    'system_prompt_and_plain_final_answer': [
+        {
+            'role': 'system',
+            'content': 'You are a helpful agent.'
+        },
+        _user('q'),
+        _assistant(_think('t1'), _call('search', query='a')),
+        _tool('search', 'r1'),
+        _assistant('answer without reasoning'),
+    ],
+    # the earlier user turn is history: the jinja drops its reasoning, the current turn keeps it
+    'history_round_with_calls': [
+        _user('q1'),
+        _assistant(_think('h1'), _call('search', query='a')),
+        _tool('search', 'r1'),
+        _assistant(_think('h2') + 'a1'),
+        _user('q2'),
+        _assistant(_think('c1'), _call('read', url='u')),
+        _tool('read', 'r2'),
+        _assistant(_think('c2') + 'a2'),
+    ],
+    'history_round_parallel_calls_with_preamble': [
+        _user('q1'),
+        _assistant(_think('h1') + 'pre', _call('search', query='a'), _call('read', url='u')),
+        _tool('search', 'r1'),
+        _tool('read', 'r2'),
+        _assistant(_think('h2') + 'a1'),
+        _user('q2'),
+        _assistant(_think('c1') + 'a2'),
+    ],
+    'history_call_without_reasoning': [
+        _user('q1'),
+        _assistant('', _call('search', query='a')),
+        _tool('search', 'r1'),
+        _assistant('a1'),
+        _user('q2'),
+        _assistant(_think('c1'), _call('read', url='u')),
+        _tool('read', 'r2'),
+        _assistant('a2'),
+    ],
+    'three_user_turns': [
+        _user('q1'),
+        _assistant(_think('h1'), _call('search', query='a')),
+        _tool('search', 'r1'),
+        _assistant('a1'),
+        _user('q2'),
+        _assistant(_think('h3'), _call('search', query='b')),
+        _tool('search', 'r2'),
+        _assistant(_think('h4') + 'a2'),
+        _user('q3'),
+        _assistant(_think('c1'), _call('search', query='c')),
+        _tool('search', 'r3'),
+        _assistant(_think('c2') + 'a3'),
+    ],
+}
+
+
+@lru_cache(maxsize=1)
+def _get_processor():
+    from swift.model import get_processor
+    return get_processor(MODEL_ID)
+
+
+class TestQwen3_5EncodeMatchesJinja(unittest.TestCase):
+    """``template.encode`` (swift backend, default arguments) must give the same token ids as the official
+    chat template for assistant turns that carry reasoning and/or ``tool_calls``.
+
+    The one deliberate difference is ``loss_scale='all'``: it keeps the reasoning of earlier user turns
+    (``preserve_thinking`` defaults to True there, because every turn is trained on), while the jinja
+    strips it. So with several user turns, ``loss_scale='all'`` is compared with ``preserve_thinking=False``.
+    """
+
+    def _encode(self, messages, *, loss_scale, **kwargs):
+        from swift.template import get_template
+        template = get_template(_get_processor(), template_type='qwen3_5', loss_scale=loss_scale, **kwargs)
+        template.set_mode('train')
+        return template.encode({'messages': copy.deepcopy(messages), 'tools': copy.deepcopy(TOOLS)})['input_ids']
+
+    def _jinja(self, messages):
+        processor = _get_processor()
+        tokenizer = getattr(processor, 'tokenizer', processor)
+        encoded = tokenizer.apply_chat_template(
+            copy.deepcopy(messages), tools=copy.deepcopy(TOOLS), tokenize=True, return_dict=True)
+        return list(encoded['input_ids'])
+
+    def _assert_same(self, name, messages, **kwargs):
+        template_ids = self._encode(messages, **kwargs)
+        jinja_ids = self._jinja(messages)
+        tokenizer = getattr(_get_processor(), 'tokenizer', _get_processor())
+        self.assertEqual(
+            template_ids,
+            jinja_ids,
+            msg=(f'{name} {kwargs}\n--- template.encode ---\n{tokenizer.decode(template_ids)}'
+                 f'\n--- chat_template.jinja ---\n{tokenizer.decode(jinja_ids)}'))
+
+    def test_last_round(self):
+        for name, messages in CASES.items():
+            with self.subTest(case=name):
+                self._assert_same(name, messages, loss_scale='last_round')
+
+    def test_all_single_user_turn(self):
+        for name, messages in CASES.items():
+            if sum(m['role'] == 'user' for m in messages) > 1:
+                continue
+            with self.subTest(case=name):
+                self._assert_same(name, messages, loss_scale='all')
+
+    def test_all_without_preserving_history_thinking(self):
+        for name, messages in CASES.items():
+            with self.subTest(case=name):
+                self._assert_same(name, messages, loss_scale='all', preserve_thinking=False)
+
+    def test_reasoning_with_tool_calls_is_rendered_once(self):
+        """#10255 dropped it; the first attempt to fix it rendered it twice."""
+        messages = CASES['issue_repro']
+        tokenizer = getattr(_get_processor(), 'tokenizer', _get_processor())
+        for loss_scale in ('last_round', 'all'):
+            text = tokenizer.decode(self._encode(messages, loss_scale=loss_scale))
+            with self.subTest(loss_scale=loss_scale):
+                self.assertEqual(text.count('I need to check the stock first.'), 1)
+                self.assertEqual(text.count('<think>\n\n</think>'), 0)
 
 
 if __name__ == '__main__':
